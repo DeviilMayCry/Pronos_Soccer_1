@@ -67,8 +67,11 @@ def _hash_file(uploaded_file) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_df_cached(file_name: str, file_bytes: bytes):
+    import io
     bio = io.BytesIO(file_bytes)
-    return motor.read_dataset(bio)  # ya normaliza nombres internos
+    bio.name = file_name  # ✅ preserva extensión (.xlsx / .csv)
+    return motor.read_dataset(bio)  # el motor ya normaliza columnas
+
 
 # ====================== Caché: ligas/equipos bonitos ======================
 @st.cache_data(show_spinner=False)
