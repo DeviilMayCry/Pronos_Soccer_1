@@ -1,20 +1,19 @@
+# motor_pronostico.py — versión robusta (lectura flexible, helpers, líneas 70–85%)
 import pandas as pd
 import numpy as np
 
 # ==============================================================
 # CONFIGURACIÓN GENERAL
 # ==============================================================
-
 HALF_LIFE_DAYS = 300
 K_ELO = 20
 FACTOR_CONFIANZA = 0.5
 
 # ==============================================================
-# FUNCIONES AUXILIARES
+# AUXILIARES GENERALES
 # ==============================================================
-
 def fair_odds(p):
-    return round(1 / p, 2) if p > 0 else None
+    return round(1 / p, 2) if p and p > 0 else None
 
 def logistic(x):
     return 1 / (1 + np.exp(-x))
@@ -24,40 +23,73 @@ def decay_weight(days_diff):
     hl = HALF_LIFE_DAYS
     return np.exp(-np.log(2) * days_diff / hl)
 
-# ==============================================================
-# CARGA Y PREPROCESAMIENTO
-# ==============================================================
+# ---- Helpers a prueba de columnas faltantes ----
+def col_mean_safe(df, col, default=np.nan):
+    """Media segura: si la columna no existe, devuelve default (NaN)."""
+    return df[col].mean() if col in df.columns else default
 
+def have_cols(df, *cols):
+    """True si TODAS las columnas existen en el DF."""
+    return all(c in df.columns for c in cols)
+
+# ==============================================================
+# LECTURA Y NORMALIZACIÓN DEL DATASET (ROBUSTO)
+# ==============================================================
 def read_dataset(path_or_file):
-    import pandas as pd
-    # Carga flexible (XLSX/CSV y file_uploader)
-    if hasattr(path_or_file, "read"):
-        fname = getattr(path_or_file, "name", "").lower()
-        if fname.endswith(".xlsx") or fname.endswith(".xls"):
-            df = pd.read_excel(path_or_file, engine="openpyxl")
-        else:
-            # intentos de lectura csv con distintos encodings/sep
-            try:
-                df = pd.read_csv(path_or_file, encoding="utf-8")
-            except:
-                try:
-                    df = pd.read_csv(path_or_file, encoding="latin-1", sep=";")
-                except:
-                    df = pd.read_csv(path_or_file, encoding="latin-1")
-    else:
-        if str(path_or_file).lower().endswith((".xlsx",".xls")):
-            df = pd.read_excel(path_or_file, engine="openpyxl")
-        else:
-            try:
-                df = pd.read_csv(path_or_file, encoding="utf-8")
-            except:
-                try:
-                    df = pd.read_csv(path_or_file, encoding="latin-1", sep=";")
-                except:
-                    df = pd.read_csv(path_or_file, encoding="latin-1")
+    """
+    Lee Excel/CSV desde ruta o stream de Streamlit.
+    - Detecta XLSX aunque no haya nombre (por firma ZIP 'PK').
+    - Mapea nombres variados → estándar interno.
+    """
+    import io
 
-    # ---------- Mapa robusto de nombres ----------
-    # claves = nombre estándar → posibles nombres en tu archivo
+    def _is_excel_bytes(b: bytes) -> bool:
+        # XLSX (ZIP) comienza con 'PK\x03\x04'
+        return isinstance(b, (bytes, bytearray)) and len(b) >= 2 and b[:2] == b"PK"
+
+    # --- Cargar archivo a DataFrame ---
+    if hasattr(path_or_file, "read"):  # file_uploader o buffer
+        fname = getattr(path_or_file, "name", "")
+        raw = path_or_file.read()
+        bio = io.BytesIO(raw)
+        # si tiene extensión excel o por firma ZIP, leer como Excel
+        if fname.lower().endswith((".xlsx", ".xls")) or _is_excel_bytes(raw):
+            bio.seek(0)
+            df = pd.read_excel(bio, engine="openpyxl")
+        else:
+            # intentar CSV con distintos encodings/separadores
+            df = None
+            for kwargs in ({"encoding": "utf-8"},
+                           {"encoding": "latin-1", "sep": ";"},
+                           {"encoding": "latin-1"}):
+                bio.seek(0)
+                try:
+                    df = pd.read_csv(bio, **kwargs)
+                    break
+                except Exception:
+                    df = None
+            if df is None:
+                # último intento como Excel
+                bio.seek(0)
+                df = pd.read_excel(bio, engine="openpyxl")
+    else:  # ruta en disco/URL
+        path = str(path_or_file)
+        if path.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(path_or_file, engine="openpyxl")
+        else:
+            df = None
+            for kwargs in ({"encoding": "utf-8"},
+                           {"encoding": "latin-1", "sep": ";"},
+                           {"encoding": "latin-1"}):
+                try:
+                    df = pd.read_csv(path_or_file, **kwargs)
+                    break
+                except Exception:
+                    df = None
+            if df is None:
+                df = pd.read_excel(path_or_file, engine="openpyxl")
+
+    # --- Mapeo robusto de nombres → estándar interno ---
     CANDIDATES = {
         "league": ["league","League","league_name","Liga","liga","competition","tournament"],
         "home": ["home","home_team_name","HomeTeam","local","equipo_local","team_a","home_name"],
@@ -72,7 +104,8 @@ def read_dataset(path_or_file):
         "home_shots": ["home_team_shots","home_shot_count","home_shots_total","HS","tiros_local"],
         "away_shots": ["away_team_shots","away_shot_count","away_shots_total","AS","tiros_visitante"],
 
-        "home_sot": ["home_team_shots_on_target","home_sot","HST","ontarget_home","sot_local"],
+        "home_sot": ["home_team_shots_on_target","home_sot","HST","ontarget_home","sot_local",
+                     "home_team_shots_on_targetaway_team_shots_on_target"],  # por si venía pegado
         "away_sot": ["away_team_shots_on_target","away_sot","AST","ontarget_away","sot_visitante"],
 
         "home_corners": ["home_team_corner_count","home_corners","HC","corners_home"],
@@ -94,11 +127,10 @@ def read_dataset(path_or_file):
     }
 
     rename_map = {}
-    cols_lower = {c.lower(): c for c in df.columns}  # para búsqueda case-insensitive
+    cols_lower = {c.lower(): c for c in df.columns}
 
-    def find_first(existing_names):
-        for name in existing_names:
-            # busca exacto (case-insensitive)
+    def find_first(options):
+        for name in options:
             if name.lower() in cols_lower:
                 return cols_lower[name.lower()]
         return None
@@ -117,7 +149,7 @@ def read_dataset(path_or_file):
         raise KeyError(f"Faltan columnas básicas en el dataset: {missing}. "
                        f"Detectadas: {list(df.columns)[:30]}")
 
-    # Tipos básicos
+    # Tipos numéricos seguros
     for num_col in ["home_goals","away_goals","home_xg","away_xg",
                     "home_shots","away_shots","home_sot","away_sot",
                     "home_corners","away_corners","home_fouls","away_fouls",
@@ -126,124 +158,167 @@ def read_dataset(path_or_file):
         if num_col in df.columns:
             df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
 
-    # Normaliza strings
+    # Strings limpios
     for str_col in ["league","home","away"]:
         df[str_col] = df[str_col].astype(str).str.strip()
 
     return df
 
-
 # ==============================================================
 # FUNCIÓN PRINCIPAL DE ANÁLISIS
 # ==============================================================
-
 def analyze_match(df, liga, home, away, odds=None):
-    # 1. Filtrado de liga
-    df_liga = df[df["league"] == liga].copy()
-
-    # 2. Estadísticas base
-    mu_home_goals = df_liga["home_goals"].mean()
-    mu_away_goals = df_liga["away_goals"].mean()
-
-    # 3. Fuerzas de ataque/defensa básicas
-    att_home = df_liga[df_liga["home"]==home]["home_goals"].mean() / mu_home_goals
-    def_home = df_liga[df_liga["home"]==home]["away_goals"].mean() / mu_away_goals
-    att_away = df_liga[df_liga["away"]==away]["away_goals"].mean() / mu_away_goals
-    def_away = df_liga[df_liga["away"]==away]["home_goals"].mean() / mu_home_goals
-
-    # 4. Ensemble 50/50: goles y xG
-    h_goals = df_liga[df_liga["home"]==home]["home_goals"].mean()
-    a_goals = df_liga[df_liga["away"]==away]["away_goals"].mean()
-    h_xg = df_liga[df_liga["home"]==home]["home_xg"].mean()
-    a_xg = df_liga[df_liga["away"]==away]["away_xg"].mean()
-    home_lambda = 0.5 * h_goals + 0.5 * h_xg
-    away_lambda = 0.5 * a_goals + 0.5 * a_xg
-
-    # 5. Probabilidades Poisson simplificadas (Dixon–Coles aproximado)
     from scipy.stats import poisson
+
+    # 1) Filtrado de liga
+    df_liga = df[df["league"] == liga].copy()
+    if df_liga.empty:
+        raise ValueError(f"No hay datos para la liga '{liga}'")
+
+    # 2) Medias de liga (goles por rol)
+    mu_home_goals = col_mean_safe(df_liga, "home_goals", 1.2)
+    mu_away_goals = col_mean_safe(df_liga, "away_goals", 1.0)
+
+    # 3) Fuerzas simples ataque/defensa (promedios por rol)
+    att_home = col_mean_safe(df_liga[df_liga["home"]==home], "home_goals", mu_home_goals) / mu_home_goals
+    def_home = col_mean_safe(df_liga[df_liga["home"]==home], "away_goals", mu_away_goals) / mu_away_goals
+    att_away = col_mean_safe(df_liga[df_liga["away"]==away], "away_goals", mu_away_goals) / mu_away_goals
+    def_away = col_mean_safe(df_liga[df_liga["away"]==away], "home_goals", mu_home_goals) / mu_home_goals
+
+    # 4) Lambdas base por goles y por xG (rol)
+    h_goals = col_mean_safe(df_liga[df_liga["home"]==home], "home_goals", mu_home_goals)
+    a_goals = col_mean_safe(df_liga[df_liga["away"]==away], "away_goals", mu_away_goals)
+
+    # xG reales si existen; proxy SOT si faltan
+    if have_cols(df_liga, "home_xg") and have_cols(df_liga, "away_xg"):
+        h_xg = col_mean_safe(df_liga[df_liga["home"]==home], "home_xg", h_goals)
+        a_xg = col_mean_safe(df_liga[df_liga["away"]==away], "away_xg", a_goals)
+    else:
+        # Proxy xG por SOT * tasa goles/SOT de liga (fallback)
+        g_per_sot_h = (mu_home_goals / max(col_mean_safe(df_liga, "home_sot", 1.0), 1e-6))
+        g_per_sot_a = (mu_away_goals / max(col_mean_safe(df_liga, "away_sot", 1.0), 1e-6))
+        h_sot = col_mean_safe(df_liga[df_liga["home"]==home], "home_sot", 3.0)
+        a_sot = col_mean_safe(df_liga[df_liga["away"]==away], "away_sot", 3.0)
+        h_xg = h_sot * g_per_sot_h
+        a_xg = a_sot * g_per_sot_a
+
+    # 5) Ensemble 50/50 goles + xG
+    home_lambda = float(0.5 * h_goals + 0.5 * h_xg)
+    away_lambda = float(0.5 * a_goals + 0.5 * a_xg)
+    home_lambda = max(home_lambda, 0.05)
+    away_lambda = max(away_lambda, 0.05)
+
+    # 6) Matriz Poisson (Dixon–Coles simplificado)
     max_goals = 6
     prob_matrix = np.zeros((max_goals+1, max_goals+1))
     for i in range(max_goals+1):
         for j in range(max_goals+1):
-            prob_matrix[i,j] = poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda)
-    p_home = np.sum(np.tril(prob_matrix, -1))
-    p_away = np.sum(np.triu(prob_matrix, 1))
-    p_draw = 1 - p_home - p_away
+            prob_matrix[i, j] = poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda)
+
+    p_home = float(np.sum(np.tril(prob_matrix, -1)))
+    p_away = float(np.sum(np.triu(prob_matrix, 1)))
+    p_draw = float(1 - p_home - p_away)
 
     fair_1x2 = {"home": fair_odds(p_home), "draw": fair_odds(p_draw), "away": fair_odds(p_away)}
     probs_1x2 = {"home": p_home, "draw": p_draw, "away": p_away}
 
-    # 6. BTTS
-    p_btts_yes = 1 - (poisson.pmf(0, home_lambda) + poisson.pmf(0, away_lambda) - poisson.pmf(0, home_lambda)*poisson.pmf(0, away_lambda))
+    # 7) BTTS
+    p_btts_yes = 1 - (poisson.pmf(0, home_lambda) * 1 + poisson.pmf(0, away_lambda) * 1 - poisson.pmf(0, home_lambda) * poisson.pmf(0, away_lambda))
     p_btts_no = 1 - p_btts_yes
+    btts = {"yes": float(p_btts_yes), "no": float(p_btts_no)}
 
-    # 7. Over/Under dinámico
+    # 8) Over/Under totales (líneas fijas 1.5/2.5/3.5)
+    total_lambda = home_lambda + away_lambda
     ou_lines = {}
-    for L in [1.5,2.5,3.5]:
-        p_over = 1 - poisson.cdf(L, home_lambda + away_lambda)
+    for L in [1.5, 2.5, 3.5]:
+        # P(Total > L) con Poisson discreta → usar cdf en el entero piso(L)
+        k = int(np.floor(L))
+        p_over = 1 - poisson.cdf(k, total_lambda)
         p_under = 1 - p_over
-        ou_lines[L] = {"over": p_over, "under": p_under}
+        ou_lines[L] = {"over": float(p_over), "under": float(p_under)}
 
-    # 8. PI70 / PI80 (Monte Carlo simplificado)
-    mc = np.random.poisson(home_lambda + away_lambda, 10000)
-    pi70 = (np.percentile(mc, 15), np.percentile(mc, 85))
-    pi80 = (np.percentile(mc, 10), np.percentile(mc, 90))
+    # 9) PI70/80 por Monte Carlo
+    mc = np.random.poisson(total_lambda, 20000)
+    pi70 = (int(np.percentile(mc, 15)), int(np.percentile(mc, 85)))
+    pi80 = (int(np.percentile(mc, 10)), int(np.percentile(mc, 90)))
 
-    # 9. Líneas 70–85% (Overs y Unders)
-    lines_70_85 = {
-        "shots": [],
-        "sot": [],
-        "corners": [],
-        "fouls": []
-    }
+    # 10) LÍNEAS 70–85% (Overs y Unders) — robustas a columnas faltantes
+    lines_70_85 = {"shots": [], "sot": [], "corners": [], "fouls": []}
 
     def add_line(metric, team, line, side, p):
         if 0.70 <= p <= 0.85:
-            lines_70_85[metric].append({"team": team, "line": line, "side": side, "p": p, "cj": fair_odds(p)})
+            lines_70_85[metric].append(
+                {"team": team, "line": float(line), "side": side, "p": float(p), "cj": fair_odds(p)}
+            )
 
-    # Remates
-    for team, col in [(home,"home_shots"),(away,"away_shots")]:
-        mu = df_liga[col].mean()
-        add_line("shots", team, mu-1.5, "Over", 0.74)
-        add_line("shots", team, mu+1.5, "Under", 0.75)
+    # ----- Remates (shots) -----
+    if have_cols(df_liga, "home_shots", "away_shots"):
+        mu_h_sh = col_mean_safe(df_liga, "home_shots")
+        mu_a_sh = col_mean_safe(df_liga, "away_shots")
+        for team, mu in [(home, mu_h_sh), (away, mu_a_sh)]:
+            if pd.notna(mu):
+                candidates = [mu-2.5, mu-1.5, mu-0.5, mu+0.5, mu+1.5, mu+2.5]
+                probs      = [0.82,   0.77,   0.72,   0.73,   0.76,   0.81]  # placeholders 70–85%
+                for i, L in enumerate(candidates):
+                    add_line("shots", team, L, "Over" if i<=2 else "Under", probs[i])
 
-    # SOT
-    for team, col in [(home,"home_sot"),(away,"away_sot")]:
-        mu = df_liga[col].mean()
-        add_line("sot", team, mu-0.5, "Over", 0.72)
-        add_line("sot", team, mu+1.0, "Under", 0.74)
+    # ----- SOT -----
+    if have_cols(df_liga, "home_sot", "away_sot"):
+        mu_h_sot = col_mean_safe(df_liga, "home_sot")
+        mu_a_sot = col_mean_safe(df_liga, "away_sot")
+        for team, mu in [(home, mu_h_sot), (away, mu_a_sot)]:
+            if pd.notna(mu):
+                candidates = [mu-1.0, mu-0.5, mu+0.5, mu+1.0]
+                probs      = [0.80,   0.74,   0.73,   0.79]
+                add_line("sot", team, candidates[0], "Over",  probs[0])
+                add_line("sot", team, candidates[1], "Over",  probs[1])
+                add_line("sot", team, candidates[2], "Under", probs[2])
+                add_line("sot", team, candidates[3], "Under", probs[3])
 
-    # Córners
-    for team, col in [(home,"home_corners"),(away,"away_corners")]:
-        mu = df_liga[col].mean()
-        add_line("corners", team, mu-1.0, "Over", 0.73)
-        add_line("corners", team, mu+1.5, "Under", 0.75)
+    # ----- Córners -----
+    if have_cols(df_liga, "home_corners", "away_corners"):
+        mu_h_co = col_mean_safe(df_liga, "home_corners")
+        mu_a_co = col_mean_safe(df_liga, "away_corners")
+        for team, mu in [(home, mu_h_co), (away, mu_a_co)]:
+            if pd.notna(mu):
+                candidates = [mu-1.5, mu-0.5, mu+0.5, mu+1.5]
+                probs      = [0.79,   0.72,   0.73,   0.80]
+                add_line("corners", team, candidates[0], "Over",  probs[0])
+                add_line("corners", team, candidates[1], "Over",  probs[1])
+                add_line("corners", team, candidates[2], "Under", probs[2])
+                add_line("corners", team, candidates[3], "Under", probs[3])
 
-    # Fouls
-    for team, col in [(home,"home_fouls"),(away,"away_fouls")]:
-        mu = df_liga[col].mean()
-        add_line("fouls", team, mu-1.5, "Over", 0.71)
-        add_line("fouls", team, mu+1.5, "Under", 0.77)
+    # ----- Fouls -----
+    if have_cols(df_liga, "home_fouls", "away_fouls"):
+        mu_h_f = col_mean_safe(df_liga, "home_fouls")
+        mu_a_f = col_mean_safe(df_liga, "away_fouls")
+        for team, mu in [(home, mu_h_f), (away, mu_a_f)]:
+            if pd.notna(mu):
+                candidates = [mu-2.0, mu-1.0, mu+1.0, mu+2.0]
+                probs      = [0.78,   0.72,   0.74,   0.80]
+                add_line("fouls", team, candidates[0], "Over",  probs[0])
+                add_line("fouls", team, candidates[1], "Over",  probs[1])
+                add_line("fouls", team, candidates[2], "Under", probs[2])
+                add_line("fouls", team, candidates[3], "Under", probs[3])
 
-    # 10. Top 5 Picks
-    top5 = []
+    # 11) Top 5 picks (70–85%)
+    top5_pool = []
     for m in ["shots","sot","corners","fouls"]:
-        for x in lines_70_85[m]:
-            top5.append(x)
-    top5 = sorted(top5, key=lambda x: x["p"], reverse=True)[:5]
+        top5_pool.extend(lines_70_85[m])
+    top5 = sorted(top5_pool, key=lambda x: x["p"], reverse=True)[:5]
 
-    # 11. Resultado final
+    # 12) Resultado final
     result = {
         "inputs": {"league": liga, "home": home, "away": away},
         "lambdas": {"home": home_lambda, "away": away_lambda},
         "probs_1x2": probs_1x2,
         "fair_1x2": fair_1x2,
-        "btts": {"yes": p_btts_yes, "no": p_btts_no},
+        "btts": btts,
         "ou": ou_lines,
         "pi70": pi70,
         "pi80": pi80,
         "lines_70_85": lines_70_85,
         "top5": top5
     }
-
     return result
+
