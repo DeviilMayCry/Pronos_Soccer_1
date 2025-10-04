@@ -6,6 +6,7 @@ import io, hashlib
 from pathlib import Path
 import motor_pronostico as motor
 
+st.caption(f"HL=300d · Elo K=20 · GSR 0.5 · Ensemble 50/50 (xG reales) · Motor {motor.__version__}")
 st.set_page_config(page_title="Fútbol Grupo – Pronósticos", layout="wide")
 
 st.title("⚽ Fútbol Grupo – Pronóstico Profesional")
