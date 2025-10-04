@@ -28,30 +28,110 @@ def decay_weight(days_diff):
 # CARGA Y PREPROCESAMIENTO
 # ==============================================================
 
-def read_dataset(path):
-    df = pd.read_excel(path, engine="openpyxl")
-    df = df.rename(columns={
-        "home_team_name": "home",
-        "away_team_name": "away",
-        "league_name": "league",
-        "home_team_goal_count": "home_goals",
-        "away_team_goal_count": "away_goals",
-        "team_a_xg": "home_xg",
-        "team_b_xg": "away_xg",
-        "home_team_shots": "home_shots",
-        "away_team_shots": "away_shots",
-        "home_team_shots_on_target": "home_sot",
-        "away_team_shots_on_target": "away_sot",
-        "home_team_corner_count": "home_corners",
-        "away_team_corner_count": "away_corners",
-        "home_team_foul_count": "home_fouls",
-        "away_team_foul_count": "away_fouls",
-        "home_team_yellow_cards": "home_yellow",
-        "away_team_yellow_cards": "away_yellow",
-        "home_team_possession": "home_poss",
-        "away_team_possession": "away_poss"
-    })
+def read_dataset(path_or_file):
+    import pandas as pd
+    # Carga flexible (XLSX/CSV y file_uploader)
+    if hasattr(path_or_file, "read"):
+        fname = getattr(path_or_file, "name", "").lower()
+        if fname.endswith(".xlsx") or fname.endswith(".xls"):
+            df = pd.read_excel(path_or_file, engine="openpyxl")
+        else:
+            # intentos de lectura csv con distintos encodings/sep
+            try:
+                df = pd.read_csv(path_or_file, encoding="utf-8")
+            except:
+                try:
+                    df = pd.read_csv(path_or_file, encoding="latin-1", sep=";")
+                except:
+                    df = pd.read_csv(path_or_file, encoding="latin-1")
+    else:
+        if str(path_or_file).lower().endswith((".xlsx",".xls")):
+            df = pd.read_excel(path_or_file, engine="openpyxl")
+        else:
+            try:
+                df = pd.read_csv(path_or_file, encoding="utf-8")
+            except:
+                try:
+                    df = pd.read_csv(path_or_file, encoding="latin-1", sep=";")
+                except:
+                    df = pd.read_csv(path_or_file, encoding="latin-1")
+
+    # ---------- Mapa robusto de nombres ----------
+    # claves = nombre estándar → posibles nombres en tu archivo
+    CANDIDATES = {
+        "league": ["league","League","league_name","Liga","liga","competition","tournament"],
+        "home": ["home","home_team_name","HomeTeam","local","equipo_local","team_a","home_name"],
+        "away": ["away","away_team_name","AwayTeam","visitante","equipo_visitante","team_b","away_name"],
+
+        "home_goals": ["home_team_goal_count","home_goals","FTHG","home_goal","goles_local"],
+        "away_goals": ["away_team_goal_count","away_goals","FTAG","away_goal","goles_visitante"],
+
+        "home_xg": ["team_a_xg","home_xg","xg_home","local_xg"],
+        "away_xg": ["team_b_xg","away_xg","xg_away","visitante_xg"],
+
+        "home_shots": ["home_team_shots","home_shot_count","home_shots_total","HS","tiros_local"],
+        "away_shots": ["away_team_shots","away_shot_count","away_shots_total","AS","tiros_visitante"],
+
+        "home_sot": ["home_team_shots_on_target","home_sot","HST","ontarget_home","sot_local"],
+        "away_sot": ["away_team_shots_on_target","away_sot","AST","ontarget_away","sot_visitante"],
+
+        "home_corners": ["home_team_corner_count","home_corners","HC","corners_home"],
+        "away_corners": ["away_team_corner_count","away_corners","AC","corners_away"],
+
+        "home_fouls": ["home_team_foul_count","home_fouls","HF","fouls_home"],
+        "away_fouls": ["away_team_foul_count","away_fouls","AF","fouls_away"],
+
+        "home_yellow": ["home_team_yellow_card_count","home_team_yellow_cards","home_yellows","HY"],
+        "away_yellow": ["away_team_yellow_card_count","away_team_yellow_cards","away_yellows","AY"],
+
+        "home_red": ["home_team_red_card_count","home_team_red_cards","home_reds","HR"],
+        "away_red": ["away_team_red_card_count","away_team_red_cards","away_reds","AR"],
+
+        "home_poss": ["home_team_possession","home_possession","possession_home","poss_local","home_poss"],
+        "away_poss": ["away_team_possession","away_possession","possession_away","poss_visitante","away_poss"],
+
+        "date": ["date_GMT","match_date","date","fecha","Date"]
+    }
+
+    rename_map = {}
+    cols_lower = {c.lower(): c for c in df.columns}  # para búsqueda case-insensitive
+
+    def find_first(existing_names):
+        for name in existing_names:
+            # busca exacto (case-insensitive)
+            if name.lower() in cols_lower:
+                return cols_lower[name.lower()]
+        return None
+
+    for std_name, options in CANDIDATES.items():
+        found = find_first(options)
+        if found:
+            rename_map[found] = std_name
+
+    df = df.rename(columns=rename_map)
+
+    # Validaciones mínimas
+    required = ["league","home","away","home_goals","away_goals"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise KeyError(f"Faltan columnas básicas en el dataset: {missing}. "
+                       f"Detectadas: {list(df.columns)[:30]}")
+
+    # Tipos básicos
+    for num_col in ["home_goals","away_goals","home_xg","away_xg",
+                    "home_shots","away_shots","home_sot","away_sot",
+                    "home_corners","away_corners","home_fouls","away_fouls",
+                    "home_yellow","away_yellow","home_red","away_red",
+                    "home_poss","away_poss"]:
+        if num_col in df.columns:
+            df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
+
+    # Normaliza strings
+    for str_col in ["league","home","away"]:
+        df[str_col] = df[str_col].astype(str).str.strip()
+
     return df
+
 
 # ==============================================================
 # FUNCIÓN PRINCIPAL DE ANÁLISIS
