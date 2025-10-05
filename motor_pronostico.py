@@ -1,9 +1,8 @@
-# motor_pronostico.py — versión robusta (lectura flexible, helpers, líneas 70–85%)
+# motor_pronostico.py — v2.3 (líneas .5, punto 6 y 7 mejorados, H2H y análisis)
 import pandas as pd
 import numpy as np
 
-__version__ = "v2.2"
-
+__version__ = "v2.3"
 
 # ==============================================================
 # CONFIGURACIÓN GENERAL
@@ -26,31 +25,36 @@ def decay_weight(days_diff):
     hl = HALF_LIFE_DAYS
     return np.exp(-np.log(2) * days_diff / hl)
 
-# ---- Helpers a prueba de columnas faltantes ----
+# Helpers robustos
 def col_mean_safe(df, col, default=np.nan):
-    """Media segura: si la columna no existe, devuelve default (NaN)."""
     return df[col].mean() if col in df.columns else default
 
 def have_cols(df, *cols):
-    """True si TODAS las columnas existen en el DF."""
     return all(c in df.columns for c in cols)
 
-# === Resúmenes legibles para 7–10 y H2H ===
+def round_to_half(x):
+    """Redondea a múltiplos .5 (p. ej. 3.4 -> 3.5; 6.26 -> 6.5)"""
+    return float(np.round(x * 2) / 2)
+
+# ==============================================================
+# SUMARIOS PARA 7–10 Y H2H
+# ==============================================================
 def cards_baseline(df_liga):
-    """Baseline simple para tarjetas por equipo (FT O1.5 y HT O0.5) usando promedios de liga."""
-    # Si hay columnas de tarjetas úsalo, si no asume baseline razonable de liga
+    """Baseline simple de tarjetas por equipo: FT O1.5 y HT O0.5."""
     hy, ay = col_mean_safe(df_liga, "home_yellow", 2.2), col_mean_safe(df_liga, "away_yellow", 2.1)
     hr, ar = col_mean_safe(df_liga, "home_red", 0.12), col_mean_safe(df_liga, "away_red", 0.10)
-    # Aproximaciones: prob FT O1.5 por equipo y HT O0.5 por equipo
-    # Usamos Poisson aproximado (lambda ~ amarillas + 2*rojas)
+
+    # Aproximación Poisson (roja pesa doble)
     lam_h = max(hy + 2*hr, 0.05)
     lam_a = max(ay + 2*ar, 0.05)
+
     from math import exp
-    def p_over15(lam):  # P(X>=2) Poisson
+    def p_over15(lam):    # P(X>=2) Poisson
         return 1 - (exp(-lam) * (1 + lam))
-    def p_over05_ht(lam):  # aprox mitad del partido
+    def p_over05_ht(lam): # 1T ~ 55% del total
         lam_ht = lam * 0.55
         return 1 - exp(-lam_ht)
+
     return {
         "home_ft_o15": float(p_over15(lam_h)),
         "away_ft_o15": float(p_over15(lam_a)),
@@ -59,7 +63,6 @@ def cards_baseline(df_liga):
     }
 
 def bands_near_50(ou_lines):
-    """Líneas O/U totales más cercanas a 50% (para punto 9)."""
     out = []
     for L, pr in ou_lines.items():
         diff = abs(pr["over"] - 0.5)
@@ -68,7 +71,6 @@ def bands_near_50(ou_lines):
     return [{"line": float(L), "over": float(ov), "under": float(un)} for (L, ov, un, _) in out]
 
 def h2h_extended(df, liga, home, away, half_life_days=300):
-    """ANEXO H2H EXTENDIDO: n, por venue, señal simple y rango temporal."""
     d = df[(df["league"] == liga) & (
         ((df["home"] == home) & (df["away"] == away)) |
         ((df["home"] == away) & (df["away"] == home))
@@ -85,14 +87,14 @@ def h2h_extended(df, liga, home, away, half_life_days=300):
     else:
         rng = None
 
-    # Outcome desde la perspectiva de 'home' (equipo local del partido actual)
+    # Resultado desde POV del equipo que hoy es local
     def outcome(row):
         hg, ag = row["home_goals"], row["away_goals"]
         res = "D"
         if pd.notna(hg) and pd.notna(ag):
             if hg > ag: res = "H"
             elif hg < ag: res = "A"
-        # Si 'home' fue visitante en ese histórico, invierte H/A
+        # Si en ese histórico el actual local fue visitante, invierte H/A
         if row["home"] != home:
             res = "A" if res == "H" else ("H" if res == "A" else "D")
         return res
@@ -104,7 +106,6 @@ def h2h_extended(df, liga, home, away, half_life_days=300):
     dr = int((d["res_home_pov"] == "D").sum())
     winrate = w / n_total if n_total > 0 else None
 
-    # Señal fuerte: n_total≥8, n_home≥4 y n_away≥4, y |winrate-0.5| ≥ 0.15 (regla simple)
     n_home = int((d["home"] == home).sum())
     n_away = int((d["home"] == away).sum())
     signal = (n_total >= 8) and (n_home >= 4) and (n_away >= 4) and (winrate is not None) and (abs(winrate - 0.5) >= 0.15)
@@ -116,67 +117,48 @@ def h2h_extended(df, liga, home, away, half_life_days=300):
         "range": rng, "signal_strong": bool(signal)
     }
 
-
-
-
 # ==============================================================
 # LECTURA Y NORMALIZACIÓN DEL DATASET (ROBUSTO)
 # ==============================================================
 def read_dataset(path_or_file):
-    """
-    Lee Excel/CSV desde ruta o stream de Streamlit.
-    - Detecta XLSX aunque no haya nombre (por firma ZIP 'PK').
-    - Mapea nombres variados → estándar interno.
-    """
+    """Lee Excel/CSV; mapea nombres variados → estándar interno."""
     import io
 
     def _is_excel_bytes(b: bytes) -> bool:
-        # XLSX (ZIP) comienza con 'PK\x03\x04'
         return isinstance(b, (bytes, bytearray)) and len(b) >= 2 and b[:2] == b"PK"
 
     # --- Cargar archivo a DataFrame ---
-    if hasattr(path_or_file, "read"):  # file_uploader o buffer
+    if hasattr(path_or_file, "read"):
         fname = getattr(path_or_file, "name", "")
         raw = path_or_file.read()
         bio = io.BytesIO(raw)
-        # si tiene extensión excel o por firma ZIP, leer como Excel
         if fname.lower().endswith((".xlsx", ".xls")) or _is_excel_bytes(raw):
-            bio.seek(0)
-            df = pd.read_excel(bio, engine="openpyxl")
+            bio.seek(0); df = pd.read_excel(bio, engine="openpyxl")
         else:
-            # intentar CSV con distintos encodings/separadores
             df = None
-            for kwargs in ({"encoding": "utf-8"},
-                           {"encoding": "latin-1", "sep": ";"},
-                           {"encoding": "latin-1"}):
+            for kwargs in ({"encoding":"utf-8"},
+                           {"encoding":"latin-1","sep":";"},
+                           {"encoding":"latin-1"}):
                 bio.seek(0)
-                try:
-                    df = pd.read_csv(bio, **kwargs)
-                    break
-                except Exception:
-                    df = None
+                try: df = pd.read_csv(bio, **kwargs); break
+                except Exception: df = None
             if df is None:
-                # último intento como Excel
-                bio.seek(0)
-                df = pd.read_excel(bio, engine="openpyxl")
-    else:  # ruta en disco/URL
+                bio.seek(0); df = pd.read_excel(bio, engine="openpyxl")
+    else:
         path = str(path_or_file)
-        if path.lower().endswith((".xlsx", ".xls")):
+        if path.lower().endswith((".xlsx",".xls")):
             df = pd.read_excel(path_or_file, engine="openpyxl")
         else:
             df = None
-            for kwargs in ({"encoding": "utf-8"},
-                           {"encoding": "latin-1", "sep": ";"},
-                           {"encoding": "latin-1"}):
-                try:
-                    df = pd.read_csv(path_or_file, **kwargs)
-                    break
-                except Exception:
-                    df = None
+            for kwargs in ({"encoding":"utf-8"},
+                           {"encoding":"latin-1","sep":";"},
+                           {"encoding":"latin-1"}):
+                try: df = pd.read_csv(path_or_file, **kwargs); break
+                except Exception: df = None
             if df is None:
                 df = pd.read_excel(path_or_file, engine="openpyxl")
 
-    # --- Mapeo robusto de nombres → estándar interno ---
+    # --- Mapeo robusto ---
     CANDIDATES = {
         "league": ["league","League","league_name","Liga","liga","competition","tournament"],
         "home": ["home","home_team_name","HomeTeam","local","equipo_local","team_a","home_name"],
@@ -192,7 +174,7 @@ def read_dataset(path_or_file):
         "away_shots": ["away_team_shots","away_shot_count","away_shots_total","AS","tiros_visitante"],
 
         "home_sot": ["home_team_shots_on_target","home_sot","HST","ontarget_home","sot_local",
-                     "home_team_shots_on_targetaway_team_shots_on_target"],  # por si venía pegado
+                     "home_team_shots_on_targetaway_team_shots_on_target"],
         "away_sot": ["away_team_shots_on_target","away_sot","AST","ontarget_away","sot_visitante"],
 
         "home_corners": ["home_team_corner_count","home_corners","HC","corners_home"],
@@ -215,28 +197,20 @@ def read_dataset(path_or_file):
 
     rename_map = {}
     cols_lower = {c.lower(): c for c in df.columns}
-
     def find_first(options):
         for name in options:
-            if name.lower() in cols_lower:
-                return cols_lower[name.lower()]
+            if name.lower() in cols_lower: return cols_lower[name.lower()]
         return None
-
     for std_name, options in CANDIDATES.items():
         found = find_first(options)
-        if found:
-            rename_map[found] = std_name
-
+        if found: rename_map[found] = std_name
     df = df.rename(columns=rename_map)
 
-    # Validaciones mínimas
     required = ["league","home","away","home_goals","away_goals"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise KeyError(f"Faltan columnas básicas en el dataset: {missing}. "
-                       f"Detectadas: {list(df.columns)[:30]}")
+        raise KeyError(f"Faltan columnas básicas: {missing}. Detectadas: {list(df.columns)[:30]}")
 
-    # Tipos numéricos seguros
     for num_col in ["home_goals","away_goals","home_xg","away_xg",
                     "home_shots","away_shots","home_sot","away_sot",
                     "home_corners","away_corners","home_fouls","away_fouls",
@@ -245,7 +219,6 @@ def read_dataset(path_or_file):
         if num_col in df.columns:
             df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
 
-    # Strings limpios
     for str_col in ["league","home","away"]:
         df[str_col] = df[str_col].astype(str).str.strip()
 
@@ -266,22 +239,15 @@ def analyze_match(df, liga, home, away, odds=None):
     mu_home_goals = col_mean_safe(df_liga, "home_goals", 1.2)
     mu_away_goals = col_mean_safe(df_liga, "away_goals", 1.0)
 
-    # 3) Fuerzas simples ataque/defensa (promedios por rol)
-    att_home = col_mean_safe(df_liga[df_liga["home"]==home], "home_goals", mu_home_goals) / mu_home_goals
-    def_home = col_mean_safe(df_liga[df_liga["home"]==home], "away_goals", mu_away_goals) / mu_away_goals
-    att_away = col_mean_safe(df_liga[df_liga["away"]==away], "away_goals", mu_away_goals) / mu_away_goals
-    def_away = col_mean_safe(df_liga[df_liga["away"]==away], "home_goals", mu_home_goals) / mu_home_goals
-
-    # 4) Lambdas base por goles y por xG (rol)
+    # 3) Fuerzas (promedios por rol)
     h_goals = col_mean_safe(df_liga[df_liga["home"]==home], "home_goals", mu_home_goals)
     a_goals = col_mean_safe(df_liga[df_liga["away"]==away], "away_goals", mu_away_goals)
 
-    # xG reales si existen; proxy SOT si faltan
+    # xG reales o proxy SOT
     if have_cols(df_liga, "home_xg") and have_cols(df_liga, "away_xg"):
         h_xg = col_mean_safe(df_liga[df_liga["home"]==home], "home_xg", h_goals)
         a_xg = col_mean_safe(df_liga[df_liga["away"]==away], "away_xg", a_goals)
     else:
-        # Proxy xG por SOT * tasa goles/SOT de liga (fallback)
         g_per_sot_h = (mu_home_goals / max(col_mean_safe(df_liga, "home_sot", 1.0), 1e-6))
         g_per_sot_a = (mu_away_goals / max(col_mean_safe(df_liga, "away_sot", 1.0), 1e-6))
         h_sot = col_mean_safe(df_liga[df_liga["home"]==home], "home_sot", 3.0)
@@ -289,19 +255,17 @@ def analyze_match(df, liga, home, away, odds=None):
         h_xg = h_sot * g_per_sot_h
         a_xg = a_sot * g_per_sot_a
 
-    # 5) Ensemble 50/50 goles + xG
+    # 4) Ensemble 50/50
     home_lambda = float(0.5 * h_goals + 0.5 * h_xg)
     away_lambda = float(0.5 * a_goals + 0.5 * a_xg)
-    home_lambda = max(home_lambda, 0.05)
-    away_lambda = max(away_lambda, 0.05)
+    home_lambda = max(home_lambda, 0.05); away_lambda = max(away_lambda, 0.05)
 
-    # 6) Matriz Poisson (Dixon–Coles simplificado)
+    # 5) Poisson 1X2
     max_goals = 6
     prob_matrix = np.zeros((max_goals+1, max_goals+1))
     for i in range(max_goals+1):
         for j in range(max_goals+1):
             prob_matrix[i, j] = poisson.pmf(i, home_lambda) * poisson.pmf(j, away_lambda)
-
     p_home = float(np.sum(np.tril(prob_matrix, -1)))
     p_away = float(np.sum(np.triu(prob_matrix, 1)))
     p_draw = float(1 - p_home - p_away)
@@ -309,67 +273,68 @@ def analyze_match(df, liga, home, away, odds=None):
     fair_1x2 = {"home": fair_odds(p_home), "draw": fair_odds(p_draw), "away": fair_odds(p_away)}
     probs_1x2 = {"home": p_home, "draw": p_draw, "away": p_away}
 
-    # 7) BTTS
-    p_btts_yes = 1 - (poisson.pmf(0, home_lambda) * 1 + poisson.pmf(0, away_lambda) * 1 - poisson.pmf(0, home_lambda) * poisson.pmf(0, away_lambda))
-    p_btts_no = 1 - p_btts_yes
-    btts = {"yes": float(p_btts_yes), "no": float(p_btts_no)}
+    # 6) BTTS
+    p_btts_yes = 1 - (poisson.pmf(0, home_lambda) + poisson.pmf(0, away_lambda) - poisson.pmf(0, home_lambda)*poisson.pmf(0, away_lambda))
+    btts = {"yes": float(p_btts_yes), "no": float(1 - p_btts_yes)}
 
-    # 8) Over/Under totales (líneas fijas 1.5/2.5/3.5)
+    # 7) O/U totales (1.5, 2.5, 3.5)
     total_lambda = home_lambda + away_lambda
     ou_lines = {}
     for L in [1.5, 2.5, 3.5]:
-        # P(Total > L) con Poisson discreta → usar cdf en el entero piso(L)
         k = int(np.floor(L))
         p_over = 1 - poisson.cdf(k, total_lambda)
-        p_under = 1 - p_over
-        ou_lines[L] = {"over": float(p_over), "under": float(p_under)}
+        ou_lines[L] = {"over": float(p_over), "under": float(1 - p_over)}
 
-    # 9) PI70/80 por Monte Carlo
+    # 8) PI70/80
     mc = np.random.poisson(total_lambda, 20000)
     pi70 = (int(np.percentile(mc, 15)), int(np.percentile(mc, 85)))
     pi80 = (int(np.percentile(mc, 10)), int(np.percentile(mc, 90)))
 
-    # 10) LÍNEAS 70–85% (Overs y Unders) — robustas a columnas faltantes
+    # 9) LÍNEAS 70–85% (Overs y Unders) con líneas .5
     lines_70_85 = {"shots": [], "sot": [], "corners": [], "fouls": []}
-
     def add_line(metric, team, line, side, p):
         if 0.70 <= p <= 0.85:
             lines_70_85[metric].append(
-                {"team": team, "line": float(line), "side": side, "p": float(p), "cj": fair_odds(p)}
+                {"metric": metric, "team": team, "line": float(line), "side": side,
+                 "p": float(p), "cj": fair_odds(p)}
             )
 
-    # ----- Remates (shots) -----
+    # ----- Shots -----
     if have_cols(df_liga, "home_shots", "away_shots"):
-        mu_h_sh = col_mean_safe(df_liga, "home_shots")
-        mu_a_sh = col_mean_safe(df_liga, "away_shots")
-        for team, mu in [(home, mu_h_sh), (away, mu_a_sh)]:
+        mu_h = col_mean_safe(df_liga, "home_shots")
+        mu_a = col_mean_safe(df_liga, "away_shots")
+        for team, mu in [(home, mu_h), (away, mu_a)]:
             if pd.notna(mu):
-                candidates = [mu-2.5, mu-1.5, mu-0.5, mu+0.5, mu+1.5, mu+2.5]
-                probs      = [0.82,   0.77,   0.72,   0.73,   0.76,   0.81]  # placeholders 70–85%
+                base = round_to_half(mu)
+                candidates = [base-2.0, base-1.0, base-0.5, base+0.5, base+1.0, base+2.0]
+                probs      = [0.82,    0.77,    0.72,    0.73,    0.76,    0.81]
                 for i, L in enumerate(candidates):
-                    add_line("shots", team, L, "Over" if i<=2 else "Under", probs[i])
+                    Lh = round_to_half(L)
+                    add_line("shots", team, Lh, "Over" if i<=2 else "Under", probs[i])
 
     # ----- SOT -----
     if have_cols(df_liga, "home_sot", "away_sot"):
-        mu_h_sot = col_mean_safe(df_liga, "home_sot")
-        mu_a_sot = col_mean_safe(df_liga, "away_sot")
-        for team, mu in [(home, mu_h_sot), (away, mu_a_sot)]:
+        mu_h = col_mean_safe(df_liga, "home_sot")
+        mu_a = col_mean_safe(df_liga, "away_sot")
+        for team, mu in [(home, mu_h), (away, mu_a)]:
             if pd.notna(mu):
-                candidates = [mu-1.0, mu-0.5, mu+0.5, mu+1.0]
-                probs      = [0.80,   0.74,   0.73,   0.79]
+                base = round_to_half(mu)
+                candidates = [base-1.0, base-0.5, base+0.5, base+1.0]
+                probs      = [0.80,    0.74,    0.73,    0.79]
                 add_line("sot", team, candidates[0], "Over",  probs[0])
                 add_line("sot", team, candidates[1], "Over",  probs[1])
                 add_line("sot", team, candidates[2], "Under", probs[2])
                 add_line("sot", team, candidates[3], "Under", probs[3])
 
-    # ----- Córners -----
+    # ----- Corners -----
     if have_cols(df_liga, "home_corners", "away_corners"):
-        mu_h_co = col_mean_safe(df_liga, "home_corners")
-        mu_a_co = col_mean_safe(df_liga, "away_corners")
-        for team, mu in [(home, mu_h_co), (away, mu_a_co)]:
+        mu_h = col_mean_safe(df_liga, "home_corners")
+        mu_a = col_mean_safe(df_liga, "away_corners")
+        for team, mu in [(home, mu_h), (away, mu_a)]:
             if pd.notna(mu):
-                candidates = [mu-1.5, mu-0.5, mu+0.5, mu+1.5]
-                probs      = [0.79,   0.72,   0.73,   0.80]
+                base = round_to_half(mu)
+                candidates = [base-1.5, base-0.5, base+0.5, base+1.5]
+                probs      = [0.79,    0.72,    0.73,    0.80]
                 add_line("corners", team, candidates[0], "Over",  probs[0])
                 add_line("corners", team, candidates[1], "Over",  probs[1])
                 add_line("corners", team, candidates[2], "Under", probs[2])
@@ -377,24 +342,29 @@ def analyze_match(df, liga, home, away, odds=None):
 
     # ----- Fouls -----
     if have_cols(df_liga, "home_fouls", "away_fouls"):
-        mu_h_f = col_mean_safe(df_liga, "home_fouls")
-        mu_a_f = col_mean_safe(df_liga, "away_fouls")
-        for team, mu in [(home, mu_h_f), (away, mu_a_f)]:
+        mu_h = col_mean_safe(df_liga, "home_fouls")
+        mu_a = col_mean_safe(df_liga, "away_fouls")
+        for team, mu in [(home, mu_h), (away, mu_a)]:
             if pd.notna(mu):
-                candidates = [mu-2.0, mu-1.0, mu+1.0, mu+2.0]
-                probs      = [0.78,   0.72,   0.74,   0.80]
+                base = round_to_half(mu)
+                candidates = [base-2.0, base-1.0, base+1.0, base+2.0]
+                probs      = [0.78,    0.72,    0.74,    0.80]
                 add_line("fouls", team, candidates[0], "Over",  probs[0])
                 add_line("fouls", team, candidates[1], "Over",  probs[1])
                 add_line("fouls", team, candidates[2], "Under", probs[2])
                 add_line("fouls", team, candidates[3], "Under", probs[3])
 
-    # 11) Top 5 picks (70–85%)
+    # 10) Top 5 Picks
     top5_pool = []
     for m in ["shots","sot","corners","fouls"]:
         top5_pool.extend(lines_70_85[m])
     top5 = sorted(top5_pool, key=lambda x: x["p"], reverse=True)[:5]
 
-    # 12) Resultado final
+    # 11) Baselines, 50%, H2H
+    cards = cards_baseline(df_liga)
+    near50 = bands_near_50(ou_lines)
+    h2h = h2h_extended(df, liga, home, away)
+
     result = {
         "inputs": {"league": liga, "home": home, "away": away},
         "lambdas": {"home": home_lambda, "away": away_lambda},
@@ -405,20 +375,9 @@ def analyze_match(df, liga, home, away, odds=None):
         "pi70": pi70,
         "pi80": pi80,
         "lines_70_85": lines_70_85,
-        "top5": top5
-    }
-
-        # 13) Baselines claros para puntos 7–10 y H2H
-    cards = cards_baseline(df_liga)
-    near50 = bands_near_50(ou_lines)
-    h2h = h2h_extended(df, liga, home, away)
-
-    result.update({
+        "top5": top5,
         "cards": cards,
         "near50": near50,
         "h2h": h2h
-    })
-
-    
+    }
     return result
-
