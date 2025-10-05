@@ -35,6 +35,90 @@ def have_cols(df, *cols):
     """True si TODAS las columnas existen en el DF."""
     return all(c in df.columns for c in cols)
 
+# === Resúmenes legibles para 7–10 y H2H ===
+def cards_baseline(df_liga):
+    """Baseline simple para tarjetas por equipo (FT O1.5 y HT O0.5) usando promedios de liga."""
+    # Si hay columnas de tarjetas úsalo, si no asume baseline razonable de liga
+    hy, ay = col_mean_safe(df_liga, "home_yellow", 2.2), col_mean_safe(df_liga, "away_yellow", 2.1)
+    hr, ar = col_mean_safe(df_liga, "home_red", 0.12), col_mean_safe(df_liga, "away_red", 0.10)
+    # Aproximaciones: prob FT O1.5 por equipo y HT O0.5 por equipo
+    # Usamos Poisson aproximado (lambda ~ amarillas + 2*rojas)
+    lam_h = max(hy + 2*hr, 0.05)
+    lam_a = max(ay + 2*ar, 0.05)
+    from math import exp
+    def p_over15(lam):  # P(X>=2) Poisson
+        return 1 - (exp(-lam) * (1 + lam))
+    def p_over05_ht(lam):  # aprox mitad del partido
+        lam_ht = lam * 0.55
+        return 1 - exp(-lam_ht)
+    return {
+        "home_ft_o15": float(p_over15(lam_h)),
+        "away_ft_o15": float(p_over15(lam_a)),
+        "home_ht_o05": float(p_over05_ht(lam_h)),
+        "away_ht_o05": float(p_over05_ht(lam_a)),
+    }
+
+def bands_near_50(ou_lines):
+    """Líneas O/U totales más cercanas a 50% (para punto 9)."""
+    out = []
+    for L, pr in ou_lines.items():
+        diff = abs(pr["over"] - 0.5)
+        out.append((L, pr["over"], pr["under"], diff))
+    out.sort(key=lambda x: x[3])
+    return [{"line": float(L), "over": float(ov), "under": float(un)} for (L, ov, un, _) in out]
+
+def h2h_extended(df, liga, home, away, half_life_days=300):
+    """ANEXO H2H EXTENDIDO: n, por venue, señal simple y rango temporal."""
+    d = df[(df["league"] == liga) & (
+        ((df["home"] == home) & (df["away"] == away)) |
+        ((df["home"] == away) & (df["away"] == home))
+    )].copy()
+    if d.empty:
+        return {"n": 0, "n_home": 0, "n_away": 0, "winrate_home_pov": None,
+                "range": None, "signal_strong": False}
+
+    # Rango temporal
+    if "date" in d.columns:
+        ds = pd.to_datetime(d["date"], errors="coerce")
+        years = ds.dt.year.dropna()
+        rng = f"{int(years.min())}–{int(years.max())}" if not years.empty else None
+    else:
+        rng = None
+
+    # Outcome desde la perspectiva de 'home' (equipo local del partido actual)
+    def outcome(row):
+        hg, ag = row["home_goals"], row["away_goals"]
+        res = "D"
+        if pd.notna(hg) and pd.notna(ag):
+            if hg > ag: res = "H"
+            elif hg < ag: res = "A"
+        # Si 'home' fue visitante en ese histórico, invierte H/A
+        if row["home"] != home:
+            res = "A" if res == "H" else ("H" if res == "A" else "D")
+        return res
+
+    d["res_home_pov"] = d.apply(outcome, axis=1)
+    n_total = len(d)
+    w = int((d["res_home_pov"] == "H").sum())
+    l = int((d["res_home_pov"] == "A").sum())
+    dr = int((d["res_home_pov"] == "D").sum())
+    winrate = w / n_total if n_total > 0 else None
+
+    # Señal fuerte: n_total≥8, n_home≥4 y n_away≥4, y |winrate-0.5| ≥ 0.15 (regla simple)
+    n_home = int((d["home"] == home).sum())
+    n_away = int((d["home"] == away).sum())
+    signal = (n_total >= 8) and (n_home >= 4) and (n_away >= 4) and (winrate is not None) and (abs(winrate - 0.5) >= 0.15)
+
+    return {
+        "n": n_total, "w": w, "d": dr, "l": l,
+        "n_home": n_home, "n_away": n_away,
+        "winrate_home_pov": winrate,
+        "range": rng, "signal_strong": bool(signal)
+    }
+
+
+
+
 # ==============================================================
 # LECTURA Y NORMALIZACIÓN DEL DATASET (ROBUSTO)
 # ==============================================================
