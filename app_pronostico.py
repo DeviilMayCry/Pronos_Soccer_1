@@ -184,25 +184,65 @@ if st.sidebar.button("🚀 Generar Pronóstico", use_container_width=True):
         st.markdown(f"**{metric.upper()}**")
         st.dataframe(dfm[["team","line","side","Prob.","CJ"]], use_container_width=True)
 
-    # 7) Tarjetas
-    st.markdown("**7) Tarjetas** — FT O1.5 / HT O0.5 (promedio de liga)")
+        # 7) Tarjetas (claro)
+    st.markdown("**7) Tarjetas por equipo** — modelo base de liga (aprox, informativo)")
+    c_home = res["cards"]["home_ft_o15"]; c_away = res["cards"]["away_ft_o15"]
+    ch_ht  = res["cards"]["home_ht_o05"]; ca_ht  = res["cards"]["away_ht_o05"]
+    st.write(
+        f"🟨 {home_pretty} — **FT O1.5**: {c_home:.0%} · **HT O0.5**: {ch_ht:.0%} | "
+        f"🟩 {away_pretty} — **FT O1.5**: {c_away:.0%} · **HT O0.5**: {ca_ht:.0%}"
+    )
 
-    # 8) PI70/80
-    st.markdown(f"**8) PI70 / PI80** — {res['pi70']} / {res['pi80']} (goles totales)")
+    # 8) PI70 / PI80 explicado
+    st.markdown("**8) PI70 / PI80 (goles totales)**")
+    st.write(f"PI70: {res['pi70'][0]}–{res['pi70'][1]}  |  PI80: {res['pi80'][0]}–{res['pi80'][1]}")
+    st.caption("Intervalos de probabilidad sobre el total de goles: 70% y 80% respectivamente (Monte Carlo).")
 
-    # 9) Bandas ≈50%
-    st.markdown("**9) Bandas ≈50%** — líneas cercanas a 50% por métrica")
+    # 9) Bandas ≈50% por métrica (usamos totals como referencia)
+    st.markdown("**9) Bandas ≈50%** — líneas cercanas a 50% (goles totales)")
+    df50 = pd.DataFrame(res["near50"])
+    if not df50.empty:
+        df50["Over"] = (df50["over"]*100).map(lambda x: f"{x:.1f}%")
+        df50["Under"] = (df50["under"]*100).map(lambda x: f"{x:.1f}%")
+        st.table(df50[["line","Over","Under"]].rename(columns={"line":"Línea"}))
+    else:
+        st.caption("No se identificaron líneas cercanas a 50%.")
 
-    # 10) Mini análisis táctico
-    st.markdown("**10) Mini análisis táctico** — timings, GSR y fuerza relativa (descriptivo)")
+    # 10) Mini análisis táctico extendido
+    st.markdown("**10) Mini análisis táctico (descriptivo)**")
+    total = res["lambdas"]["home"] + res["lambdas"]["away"]
+    bullets = [
+        f"**Fuerzas esperadas** — 🟨 {home_pretty}: {res['lambdas']['home']:.2f} xG/g; "
+        f"🟩 {away_pretty}: {res['lambdas']['away']:.2f} xG/g; **Total** ~ {total:.2f}.",
+        "Tempos esperados: inicio con cautela (0–30'), mejora de generación en 31–60', y cierres más verticales 61–90' (promedio de liga).",
+        "Game State Reaction: ajustes moderados (factor 0.5) si hay gol temprano / marca primero.",
+        "Localía ya incorporada en las fuerzas por rol (no se aplica ajuste adicional)."
+    ]
+    st.write("\n".join([f"- {b}" for b in bullets]))
 
-    # 11) Top 5 Picks
+    # 11) Top 5 Picks (ya lo tienes arriba, lo dejamos)
     st.markdown("**11) 📌 Top 5 Picks (70–85% · CJ 1.30–1.50)**")
     t5 = pd.DataFrame([
         {
-            "Pick": f"{(home_pretty if x['team']==home else away_pretty)} {x['side']} {x['line']}",
+            "Pick": f"{(home_pretty if x['team']==home else away_pretty)} {x['side']} {x['line']:.1f}",
             "Prob.": f"{x['p']:.0%}",
             "CJ": f"{x['cj']:.2f}"
         } for x in res["top5"]
     ])
     st.dataframe(t5, use_container_width=True)
+
+    # === ANEXO H2H EXTENDIDO ===
+    st.markdown("---")
+    st.markdown("### ANEXO — H2H extendido (no ajusta probabilidades)")
+    h2h = res.get("h2h", {})
+    if h2h and h2h["n"] > 0:
+        sig = "⚠️ Señal Fuerte" if h2h["signal_strong"] else "—"
+        st.write(
+            f"n={h2h['n']} (local {h2h['n_home']}, visita {h2h['n_away']}) · "
+            f"Winrate {home_pretty} (pov actual): {h2h['winrate_home_pov']:.0%} · "
+            f"Rango: {h2h['range']} · {sig}"
+        )
+        st.caption("Reglas: Half-life H2H=300d; señal fuerte si n≥8, venue≥4/4, |Δ|≥15pp (regla simple).")
+    else:
+        st.caption("Sin H2H suficiente para este cruce en la liga seleccionada.")
+
