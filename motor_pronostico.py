@@ -180,8 +180,8 @@ def read_dataset(path_or_file):
         "home_corners": ["home_team_corner_count","home_corners","HC","corners_home"],
         "away_corners": ["away_team_corner_count","away_corners","AC","corners_away"],
 
-        "home_fouls": ["home_team_foul_count","home_fouls","HF","fouls_home"],
-        "away_fouls": ["away_team_foul_count","away_fouls","AF","fouls_away"],
+        "home_fouls": ["home_team_fouls","home_fouls","HF","fouls_home"],
+        "away_fouls": ["away_team_fouls","away_fouls","AF","fouls_away"],
 
         "home_yellow": ["home_team_yellow_card_count","home_team_yellow_cards","home_yellows","HY"],
         "away_yellow": ["away_team_yellow_card_count","away_team_yellow_cards","away_yellows","AY"],
