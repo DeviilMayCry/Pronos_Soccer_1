@@ -407,5 +407,18 @@ def analyze_match(df, liga, home, away, odds=None):
         "lines_70_85": lines_70_85,
         "top5": top5
     }
+
+        # 13) Baselines claros para puntos 7–10 y H2H
+    cards = cards_baseline(df_liga)
+    near50 = bands_near_50(ou_lines)
+    h2h = h2h_extended(df, liga, home, away)
+
+    result.update({
+        "cards": cards,
+        "near50": near50,
+        "h2h": h2h
+    })
+
+    
     return result
 
